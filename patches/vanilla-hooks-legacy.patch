@@ -1,0 +1,474 @@
+diff --git a/apps/craft-anything/build.rs b/apps/craft-anything/build.rs
+index de78f17..37289ac 100644
+--- a/apps/craft-anything/build.rs
++++ b/apps/craft-anything/build.rs
+@@ -1,9 +1,22 @@
+ //! Windows only: embed the app icon and version info (VERSIONINFO) into `craft-anything.exe`.
+ //!
++//! Also embed an application manifest that marks the process PerMonitorV2 DPI-aware. Without this,
++//! Windows may bitmap-scale the window at non-100% display scaling which makes egui text and lines
++//! look blurry.
++//!
+ //! On every other target this does nothing. A missing resource compiler is a warning, so a
+ //! cross-compile from macOS or Linux still links, unless `CRAFT_ANYTHING_REQUIRE_WINRES=1` (set by
+ //! the release workflow) turns it into an error.
+ 
++const MANIFEST: &str = r#"<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
++  <application xmlns="urn:schemas-microsoft-com:asm.v3">
++    <windowsSettings>
++      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
++      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
++    </windowsSettings>
++  </application>
++</assembly>"#;
++
+ fn main() {
+     println!("cargo:rerun-if-changed=build.rs");
+     println!("cargo:rerun-if-changed=../../assets/app-icon/craft-anything.ico");
+@@ -12,7 +25,8 @@ fn main() {
+         return;
+     }
+     let mut res = winresource::WindowsResource::new();
+-    res.set_icon("../../assets/app-icon/craft-anything.ico")
++    res.set_manifest(MANIFEST)
++        .set_icon("../../assets/app-icon/craft-anything.ico")
+         .set("ProductName", "Craft Anything")
+         .set("FileDescription", "Craft Anything: find out how any software works")
+         .set("LegalCopyright", "Copyright (c) the ArtCraft Team and the Craft Anything contributors. MIT OR Apache-2.0.")
+diff --git a/crates/ui-egui/Cargo.toml b/crates/ui-egui/Cargo.toml
+index 1a9bb47..9e0cf7c 100644
+--- a/crates/ui-egui/Cargo.toml
++++ b/crates/ui-egui/Cargo.toml
+@@ -24,6 +24,7 @@ eframe = { workspace = true, features = ["default_fonts", "wgpu", "accesskit", "
+ serde = { workspace = true }
+ serde_json = { workspace = true }
+ log = { workspace = true }
++ureq = { version = "3.5", features = ["rustls"] }
+ 
+ [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+ # Native open/save dialogs, always shown from a worker thread (never blocks a frame).
+diff --git a/crates/ui-egui/src/builders.rs b/crates/ui-egui/src/builders.rs
+index def1b40..4f0376d 100644
+--- a/crates/ui-egui/src/builders.rs
++++ b/crates/ui-egui/src/builders.rs
+@@ -126,9 +126,13 @@ impl CraftApp {
+ 
+     /// Remove an AI and its stored key.
+     pub fn remove_backend(&mut self, name: &str) {
+-        let (hub, name) = (self.hub.clone(), name.to_string());
++        let (hub, name_str) = (self.hub.clone(), name.to_string());
++        self.backends.retain(|b| b.name != name_str);
++        if self.state.backend.as_deref() == Some(&name_str) {
++            self.state.backend = None;
++        }
+         self.jobs.spawn(tr("Remove an AI"), false, move |_| {
+-            hub.remove_backend(&name).map_err(|e| e.message)?;
++            hub.remove_backend(&name_str).map_err(|e| e.message)?;
+             Ok(crate::backends(&hub))
+         });
+     }
+diff --git a/crates/ui-egui/src/lib.rs b/crates/ui-egui/src/lib.rs
+index 50d0d17..198d4b3 100644
+--- a/crates/ui-egui/src/lib.rs
++++ b/crates/ui-egui/src/lib.rs
+@@ -7,7 +7,11 @@
+ //! holding it never freezes a frame; the last snapshot ([`SessionView`]) is shown meanwhile.
+ #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+ 
++pub mod artcraft_agent;
++pub mod artcraft_drive;
++pub mod artcraft_theme;
+ pub mod builders;
++pub mod craft_family_scaffold;
+ pub mod chat;
+ pub mod demo;
+ pub mod engine_ui;
+@@ -426,13 +430,21 @@ pub struct CraftApp {
+     last_view: Option<Instant>,
+     applied_theme: Option<(ThemeKind, bool)>,
+     started: bool,
++    pub artcraft_drive: artcraft_drive::ArtCraftDrive,
++    pub artcraft_agent: artcraft_agent::ArtCraftAgent,
+ }
+ 
+ impl CraftApp {
+     pub fn new(engine: Arc<Engine>, hub: Arc<AiHub>) -> Self {
+         // Wait for the engine if it's busy: defaults here would show Clean room and no AI, and the
+         // next settings change would save them over the person's own.
+-        let settings = engine.session().settings.clone();
++        let mut settings = engine.session().settings.clone();
++        let global_theme = match crate::artcraft_theme::AppTheme::load_global() {
++            crate::artcraft_theme::AppTheme::Light => ThemeKind::StudioLight,
++            crate::artcraft_theme::AppTheme::Aurora => ThemeKind::Aurora,
++            crate::artcraft_theme::AppTheme::Dark => ThemeKind::Studio,
++        };
++        settings.theme = global_theme.id().to_string();
+         i18n::set_language(&settings.language);
+         CraftApp {
+             engine,
+@@ -488,6 +500,8 @@ impl CraftApp {
+             last_view: None,
+             applied_theme: None,
+             started: false,
++            artcraft_drive: artcraft_drive::ArtCraftDrive::new("AnyCraft", "craftproj"),
++            artcraft_agent: artcraft_agent::ArtCraftAgent::new(),
+         }
+     }
+ 
+@@ -652,6 +666,13 @@ impl CraftApp {
+         }));
+     }
+ 
++    pub fn sync_and_save_settings(&mut self) -> Result<(), String> {
++        if let Some(s) = self.engine.try_session() {
++            self.settings.ai = s.settings.ai.clone();
++        }
++        self.settings.save().map_err(|e| e.to_string())
++    }
++
+     pub fn set_mode(&mut self, mode: Mode) {
+         if self.settings.mode != mode {
+             self.settings.mode = mode;
+@@ -1294,6 +1315,9 @@ impl CraftApp {
+                 self.builder = builder;
+                 self.extractor = extractor;
+                 self.backend_options = options;
++                if let Some(s) = self.engine.try_session() {
++                    self.settings.ai = s.settings.ai.clone();
++                }
+             }
+             Done::ModelChoices { name, result } => match result {
+                 // Kept only while the picker is still open for that AI.
+@@ -1453,6 +1477,8 @@ impl CraftApp {
+             theme::apply(ctx, want.0, want.1);
+             self.applied_theme = Some(want);
+         }
++        self.poll_artcraft_agent();
++        self.artcraft_autosave_tick();
+         for f in self.jobs.poll() {
+             guard("job result", || self.handle_done(f));
+         }
+@@ -1511,6 +1537,64 @@ impl CraftApp {
+         egui::Panel::top("titlebar").exact_size(titlebar::HEIGHT).frame(egui::Frame::new().fill(t.chrome)).show(ui, |ui| {
+             guard_ui(ui, "title bar", |ui| titlebar::show(self, ui));
+         });
++
++        if self.settings.first_run_done {
++            egui::Panel::bottom("artcraft_global_footer")
++                .exact_size(28.0)
++                .resizable(false)
++                .frame(egui::Frame::new().fill(t.chrome).inner_margin(egui::Margin::symmetric(12, 3)))
++                .show(ui, |ui| {
++                    let bar = ui.max_rect();
++                    ui.painter().hline(bar.x_range(), bar.top(), egui::Stroke::new(1.0, t.separator));
++                    if t.kind == ThemeKind::Aurora {
++                        let line_rect = egui::Rect::from_min_max(egui::pos2(bar.left(), bar.top()), egui::pos2(bar.right(), bar.top() + 1.5));
++                        crate::artcraft_theme::paint_gemini_rainbow_line(ui.painter(), line_rect);
++                    }
++                    ui.horizontal_centered(|ui| {
++                        let n_jobs = self.jobs.running().filter(|j| j.visible).count();
++                        let status_dot_col = if n_jobs > 0 { t.accent } else { t.success };
++                        ui.label(egui::RichText::new("●").size(10.0).color(status_dot_col));
++                        let status_text = if n_jobs > 0 {
++                            i18n::trf("{n} job(s) running", &[("n", &n_jobs.to_string())])
++                        } else {
++                            tr("Ready")
++                        };
++                        ui.label(egui::RichText::new(status_text).color(t.text_dim).size(11.5));
++                        ui.label(egui::RichText::new("·").color(t.text_faint).size(11.5));
++                        let mode_label = if self.beginner() { "Simple Mode" } else { "Advanced Workbench" };
++                        ui.label(egui::RichText::new(mode_label).color(t.text_faint).size(11.5));
++                        if self.view.ledger_len > 0 {
++                            ui.label(egui::RichText::new(format!("· {} {}", self.view.ledger_len, tr("findings"))).color(t.text_faint).size(11.5));
++                        }
++
++                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
++                            let current_kind = self.theme_kind();
++                            let mut cur_theme = match current_kind {
++                                ThemeKind::StudioLight => crate::artcraft_theme::AppTheme::Light,
++                                ThemeKind::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++                                ThemeKind::Studio => crate::artcraft_theme::AppTheme::Dark,
++                            };
++                            if crate::artcraft_theme::render_theme_switcher_dropdown(ui, &mut cur_theme) {
++                                let tk = match cur_theme {
++                                    crate::artcraft_theme::AppTheme::Light => ThemeKind::StudioLight,
++                                    crate::artcraft_theme::AppTheme::Aurora => ThemeKind::Aurora,
++                                    crate::artcraft_theme::AppTheme::Dark => ThemeKind::Studio,
++                                };
++                                self.settings.theme = tk.id().to_string();
++                                self.settings_changed();
++                                theme::apply(ui.ctx(), tk, self.beginner());
++                                self.applied_theme = Some((tk, self.beginner()));
++                            }
++                        });
++                    });
++                });
++        }
++
++        let proj_summary = self.artcraft_project_summary();
++        let proj_dir = self.artcraft_drive.active_project_dir();
++        let proj_dir_str = proj_dir.to_string_lossy().to_string();
++        self.artcraft_agent.render_sidebar(ui, &proj_summary, &proj_dir_str);
++        self.poll_artcraft_agent();
+         self.stuck_banner(ui, &ctx);
+         if !self.settings.first_run_done {
+             egui::CentralPanel::default().frame(egui::Frame::new().fill(t.canvas)).show(ui, |ui| guard_ui(ui, "first run", |ui| first_run::show(self, ui)));
+@@ -1701,7 +1785,7 @@ impl eframe::App for CraftApp {
+         }
+         // A change not written yet (or one being written as the window closed) is written now.
+         if self.persist && (self.settings_dirty || self.save_due.is_some() || self.saving.is_some()) {
+-            let _ = self.settings.save();
++            let _ = self.sync_and_save_settings();
+         }
+     }
+ }
+@@ -1740,3 +1824,5 @@ pub fn kind_icon(k: TargetKind) -> &'static str {
+         TargetKind::Unknown => "file",
+     }
+ }
++
++include!("artcraft_mcp.rs");
+diff --git a/crates/ui-egui/src/make.rs b/crates/ui-egui/src/make.rs
+index 061d135..3d9d990 100644
+--- a/crates/ui-egui/src/make.rs
++++ b/crates/ui-egui/src/make.rs
+@@ -79,6 +79,11 @@ pub fn hero(app: &mut CraftApp, ui: &mut Ui, w: f32) {
+     ui.add_space(16.0);
+     widgets::card(&t).inner_margin(Margin::same(20)).show(ui, |ui| {
+         ui.set_width(w - 50.0);
++        if t.kind == crate::theme::ThemeKind::Aurora {
++            let (r, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 2.5), Sense::hover());
++            crate::artcraft_theme::paint_gemini_rainbow_line(ui.painter(), r);
++            ui.add_space(10.0);
++        }
+         step_title(ui, 1, "What do you want to recreate?");
+         ui.add_space(12.0);
+         choose_target(app, ui);
+@@ -153,6 +158,7 @@ pub fn hero(app: &mut CraftApp, ui: &mut Ui, w: f32) {
+         ui.add_space(10.0);
+         crate::folders::make_line(app, ui);
+     });
++
+ }
+ 
+ /// "Just look inside": what to look at, each opening straight away. Nothing is built or run.
+diff --git a/crates/ui-egui/src/settings_ui.rs b/crates/ui-egui/src/settings_ui.rs
+index abe72c2..c396b0d 100644
+--- a/crates/ui-egui/src/settings_ui.rs
++++ b/crates/ui-egui/src/settings_ui.rs
+@@ -176,11 +176,26 @@ fn general(app: &mut CraftApp, ui: &mut Ui) {
+             }
+         });
+     });
+-    row(ui, "Theme", "", |ui| {
+-        let sel = usize::from(app.theme_kind() == ThemeKind::StudioLight);
+-        if let Some(i) = widgets::segmented(ui, &["Studio", "Studio Light"], sel, 30.0) {
+-            app.settings.theme = ThemeKind::ALL.get(i).copied().unwrap_or_default().id().into();
++    row(ui, "Theme", "Craft Suite Theme-System (✨ Aurora, 🌙 Dark, ☀️ Light)", |ui| {
++        let sel = match app.theme_kind() {
++            ThemeKind::Aurora => 0,
++            ThemeKind::Studio => 1,
++            ThemeKind::StudioLight => 2,
++        };
++        if let Some(i) = widgets::segmented(ui, &["✨ Aurora", "🌙 Dark", "☀️ Light"], sel, 30.0) {
++            let k = match i {
++                0 => ThemeKind::Aurora,
++                2 => ThemeKind::StudioLight,
++                _ => ThemeKind::Studio,
++            };
++            app.settings.theme = k.id().into();
+             app.settings_changed();
++            let global_theme = match k {
++                ThemeKind::Studio => crate::artcraft_theme::AppTheme::Dark,
++                ThemeKind::StudioLight => crate::artcraft_theme::AppTheme::Light,
++                ThemeKind::Aurora => crate::artcraft_theme::AppTheme::Aurora,
++            };
++            crate::artcraft_theme::AppTheme::save_global(global_theme);
+         }
+     });
+     // A choice of one isn't a choice: the row appears once there's a second language.
+diff --git a/crates/ui-egui/src/theme.rs b/crates/ui-egui/src/theme.rs
+index e075c81..477a515 100644
+--- a/crates/ui-egui/src/theme.rs
++++ b/crates/ui-egui/src/theme.rs
+@@ -16,15 +16,17 @@ pub enum ThemeKind {
+     #[default]
+     Studio,
+     StudioLight,
++    Aurora,
+ }
+ 
+ impl ThemeKind {
+-    pub const ALL: [ThemeKind; 2] = [ThemeKind::Studio, ThemeKind::StudioLight];
++    pub const ALL: [ThemeKind; 3] = [ThemeKind::Studio, ThemeKind::StudioLight, ThemeKind::Aurora];
+ 
+     pub fn label(self) -> &'static str {
+         match self {
+             ThemeKind::Studio => "Studio (dark)",
+             ThemeKind::StudioLight => "Studio Light",
++            ThemeKind::Aurora => "Aurora Mode",
+         }
+     }
+ 
+@@ -33,12 +35,14 @@ impl ThemeKind {
+         match self {
+             ThemeKind::Studio => "studio",
+             ThemeKind::StudioLight => "studio-light",
++            ThemeKind::Aurora => "aurora",
+         }
+     }
+ 
+     pub fn from_id(s: &str) -> ThemeKind {
+         match s.trim().to_ascii_lowercase().replace(['_', ' '], "-").as_str() {
+             "studio-light" | "light" => ThemeKind::StudioLight,
++            "aurora" => ThemeKind::Aurora,
+             _ => ThemeKind::Studio,
+         }
+     }
+@@ -113,30 +117,30 @@ impl Tokens {
+             // and controls its warm ink (#f2f1ee) laid over the background at 4-15%.
+             ThemeKind::Studio => Tokens {
+                 kind,
+-                chrome: Color32::from_rgb(0x10, 0x10, 0x14),
+-                canvas: Color32::from_rgb(0x12, 0x13, 0x16),
+-                card: Color32::from_rgb(0x1b, 0x1c, 0x1f),
+-                card_border: Color32::from_rgb(0x34, 0x34, 0x36),
+-                raised: Color32::from_rgb(0x22, 0x23, 0x25),
+-                field: Color32::from_rgb(0x1b, 0x1c, 0x1f),
+-                field_border: Color32::from_rgb(0x6c, 0x6c, 0x6c),
+-                hover: Color32::from_rgb(0x22, 0x23, 0x25),
+-                pressed: Color32::from_rgb(0x2d, 0x2e, 0x30),
+-                text: Color32::from_rgb(0xf2, 0xf1, 0xee),
+-                text_dim: Color32::from_rgb(0xb3, 0xb3, 0xb2),
+-                text_faint: Color32::from_rgb(0x8d, 0x8d, 0x8d),
+-                icon: Color32::from_rgb(0xa8, 0xa8, 0xa6),
++                chrome: Color32::from_rgb(0x18, 0x18, 0x1B),
++                canvas: Color32::from_rgb(0x12, 0x12, 0x14),
++                card: Color32::from_rgb(0x20, 0x20, 0x24),
++                card_border: Color32::from_rgb(0x27, 0x27, 0x2A),
++                raised: Color32::from_rgb(0x20, 0x20, 0x24),
++                field: Color32::from_rgb(0x20, 0x20, 0x24),
++                field_border: Color32::from_rgb(0x27, 0x27, 0x2A),
++                hover: Color32::from_rgb(0x27, 0x27, 0x2A),
++                pressed: Color32::from_rgb(0x32, 0x32, 0x38),
++                text: Color32::from_rgb(0xED, 0xED, 0xED),
++                text_dim: Color32::from_rgb(0xA1, 0xA1, 0xAA),
++                text_faint: Color32::from_rgb(0x71, 0x71, 0x7A),
++                icon: Color32::from_rgb(0xA1, 0xA1, 0xAA),
+                 accent: BRAND,
+                 accent_hover: Color32::from_rgb(0x2d, 0x81, 0xff),
+                 accent_ink: Color32::from_rgb(0x74, 0xaa, 0xff),
+                 accent_soft: Color32::from_rgba_unmultiplied(0x2d, 0x81, 0xff, 44),
+                 on_accent: Color32::WHITE,
+-                separator: Color32::from_rgb(0x24, 0x25, 0x27),
++                separator: Color32::from_rgb(0x27, 0x27, 0x2A),
+                 shadow: Color32::from_black_alpha(120),
+                 danger: Color32::from_rgb(0xff, 0x62, 0x59),
+                 warning: BEST_GUESS,
+                 success: Color32::from_rgb(0x5b, 0xbf, 0x8f),
+-                code_bg: Color32::from_rgb(0x06, 0x06, 0x07),
++                code_bg: Color32::from_rgb(0x12, 0x12, 0x14),
+                 radius_sm: 6.0,
+                 radius: 8.0,
+                 radius_lg: 12.0,
+@@ -173,6 +177,36 @@ impl Tokens {
+                 radius: 8.0,
+                 radius_lg: 12.0,
+             },
++            ThemeKind::Aurora => Tokens {
++                kind,
++                chrome: Color32::from_rgb(0x0F, 0x13, 0x22),
++                canvas: Color32::from_rgb(0x09, 0x0B, 0x14),
++                card: Color32::from_rgb(0x16, 0x1B, 0x30),
++                card_border: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++                raised: Color32::from_rgb(0x16, 0x1B, 0x30),
++                field: Color32::from_rgb(0x16, 0x1B, 0x30),
++                field_border: Color32::from_rgba_unmultiplied(139, 92, 246, 56),
++                hover: Color32::from_rgb(0x1E, 0x24, 0x40),
++                pressed: Color32::from_rgb(0x28, 0x30, 0x56),
++                text: Color32::from_rgb(0xF1, 0xF3, 0xF9),
++                text_dim: Color32::from_rgb(0x94, 0xA3, 0xB8),
++                text_faint: Color32::from_rgb(0x64, 0x74, 0x8B),
++                icon: Color32::from_rgb(0x94, 0xA3, 0xB8),
++                accent: Color32::from_rgb(0xA8, 0x55, 0xF7),
++                accent_hover: Color32::from_rgb(0xC0, 0x84, 0xFC),
++                accent_ink: Color32::from_rgb(0xC0, 0x84, 0xFC),
++                accent_soft: Color32::from_rgba_unmultiplied(168, 85, 247, 44),
++                on_accent: Color32::WHITE,
++                separator: Color32::from_rgba_unmultiplied(139, 92, 246, 40),
++                shadow: Color32::from_black_alpha(120),
++                danger: Color32::from_rgb(0xff, 0x62, 0x59),
++                warning: BEST_GUESS,
++                success: Color32::from_rgb(0x5b, 0xbf, 0x8f),
++                code_bg: Color32::from_rgb(0x09, 0x0B, 0x14),
++                radius_sm: 6.0,
++                radius: 8.0,
++                radius_lg: 12.0,
++            },
+         }
+     }
+ 
+@@ -182,7 +216,7 @@ impl Tokens {
+     }
+ 
+     pub fn dark(&self) -> bool {
+-        self.kind == ThemeKind::Studio
++        self.kind != ThemeKind::StudioLight
+     }
+ 
+     pub fn r_sm(&self) -> CornerRadius {
+diff --git a/crates/ui-egui/src/titlebar.rs b/crates/ui-egui/src/titlebar.rs
+index 9d2ee60..8ea1931 100644
+--- a/crates/ui-egui/src/titlebar.rs
++++ b/crates/ui-egui/src/titlebar.rs
+@@ -108,6 +108,10 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
+         ctx.send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized(&ctx)));
+     }
+     ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, egui::Stroke::new(1.0, t.separator));
++    if t.kind == crate::theme::ThemeKind::Aurora {
++        let line_rect = egui::Rect::from_min_max(egui::pos2(bar.left(), bar.bottom() - 2.0), egui::pos2(bar.right(), bar.bottom()));
++        crate::artcraft_theme::paint_gemini_rainbow_line(ui.painter(), line_rect);
++    }
+     // A download anywhere in the app fills the bottom edge of the bar, on every screen.
+     let download = crate::engine_ui::global_download(app);
+     if let Some((_, Some(f), _)) = &download {
+@@ -150,8 +154,25 @@ pub fn show(app: &mut CraftApp, ui: &mut Ui) {
+                 ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+             }
+             rule(ui);
++            ui.spacing_mut().item_spacing.x = 6.0;
++            ui.add_space(6.0);
++
++            let drive_detected = app.artcraft_drive.is_drive_detected();
++            let (proj_name, proj_dir) = if let Some(ws) = &app.workspace {
++                (ws.manifest.name.clone(), ws.root.clone())
++            } else {
++                (app.artcraft_drive.active_project_folder_name(), app.artcraft_drive.active_project_dir())
++            };
++            crate::artcraft_theme::render_top_right_action_bar(
++                ui,
++                &mut app.artcraft_drive.auto_save_enabled,
++                drive_detected,
++                &proj_name,
++                &proj_dir,
++                &mut app.artcraft_agent.is_open,
++            );
+             ui.spacing_mut().item_spacing.x = 10.0;
+-            ui.add_space(4.0);
++            rule(ui);
+             if let Some((title, fraction, message)) = download {
+                 if download_pill(ui, &title, fraction).on_hover_text(message).clicked() {
+                     app.state.modal = Some(match app.engine_flow.job {
+diff --git a/crates/ui-egui/src/workbench.rs b/crates/ui-egui/src/workbench.rs
+index 279bed9..3801da7 100644
+--- a/crates/ui-egui/src/workbench.rs
++++ b/crates/ui-egui/src/workbench.rs
+@@ -862,7 +862,7 @@ fn unknowns(app: &mut CraftApp, ui: &mut Ui) {
+     });
+ }
+ 
+-fn status_line(app: &CraftApp, ui: &mut Ui) {
++fn status_line(app: &mut CraftApp, ui: &mut Ui) {
+     let t = Tokens::get(ui.ctx());
+     let n = app.jobs.running().filter(|j| j.visible).count();
+     let text = if n > 0 { crate::i18n::trf("{n} job(s) running", &[("n", &n.to_string())]) } else { tr("Ready") };

@@ -1,0 +1,26 @@
+{
+  "plugin_name": "AnyCraft-Plugin",
+  "target_application": "AnyCraft (Craft Anything)",
+  "upstream_repository": "https://github.com/storytold/craft-anything",
+  "tested_vanilla_commit": "801f060368c3b92540e2956e871fb6967f76c5f5",
+  "tested_vanilla_commit_subject": "Refuse pictures over 20 MB when they are added (#720)",
+  "tested_vanilla_commit_date": "2026-11-04 02:13:10 +0700",
+  "standalone_plugin_modules": [
+    "crates/ui-egui/src/artcraft_agent.rs",
+    "crates/ui-egui/src/artcraft_mcp.rs",
+    "crates/ui-egui/src/artcraft_drive.rs",
+    "crates/ui-egui/src/artcraft_theme.rs",
+    "crates/ui-egui/src/craft_family_scaffold.rs"
+  ],
+  "hooked_vanilla_files": [
+    "apps/craft-anything/build.rs",
+    "crates/ui-egui/Cargo.toml",
+    "crates/ui-egui/src/builders.rs",
+    "crates/ui-egui/src/lib.rs",
+    "crates/ui-egui/src/make.rs",
+    "crates/ui-egui/src/settings_ui.rs",
+    "crates/ui-egui/src/theme.rs",
+    "crates/ui-egui/src/titlebar.rs",
+    "crates/ui-egui/src/workbench.rs"
+  ]
+}
